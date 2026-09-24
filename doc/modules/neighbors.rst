@@ -140,9 +140,36 @@ of valid metrics use `KDTree.valid_metrics` and `BallTree.valid_metrics`:
 
     >>> from sklearn.neighbors import KDTree, BallTree
     >>> KDTree.valid_metrics
-    ['euclidean', 'l2', 'minkowski', 'p', 'manhattan', 'cityblock', 'l1', 'chebyshev', 'infinity']
+    ['euclidean', 'l2', 'minkowski', 'p', 'manhattan', 'cityblock', 'l1', 'chebyshev', 'infinity', 'kl', 'dkl', 'is', 'dis']
     >>> BallTree.valid_metrics
     ['euclidean', 'l2', 'minkowski', 'p', 'manhattan', 'cityblock', 'l1', 'chebyshev', 'infinity', 'seuclidean', 'mahalanobis', 'hamming', 'canberra', 'braycurtis', 'jaccard', 'dice', 'rogerstanimoto', 'russellrao', 'sokalmichener', 'sokalsneath', 'haversine', 'pyfunc']
+
+The :class:`KDTree` additionally supports the decomposable Bregman divergences
+``'kl'`` (generalised Kullback-Leibler), ``'is'`` (Itakura-Saito) and their
+duals ``'dkl'`` and ``'dis'``, which reverse the direction of the divergence.
+A divergence is asymmetric and is measured from the query points to the
+training points; the data must be non-negative (``'kl'``, ``'dkl'``) or
+strictly positive (``'is'``, ``'dis'``). The node bounds of a KD tree
+decompose over coordinates for these divergences just as they do for Minkowski
+metrics, so the search stays exact. Because a divergence is not a metric, the
+:class:`BallTree` does not support it. See [PW2025]_ for details:
+
+    >>> import numpy as np
+    >>> rng = np.random.RandomState(0)
+    >>> X = rng.uniform(0.1, 1, (100, 3))
+    >>> kdt = KDTree(X, metric='kl')
+    >>> dist, ind = kdt.query(X[:2], k=3)
+
+Both trees also accept an ``eps`` argument in :meth:`KDTree.query` and
+:meth:`BallTree.query` for :math:`(1 + \epsilon)`-approximate searches: the
+:math:`j`-th neighbor returned is at most :math:`1 + \epsilon` times as far as
+the true :math:`j`-th nearest neighbor, which can be much faster in higher
+dimensions.
+
+.. rubric:: References
+
+.. [PW2025] T. Pham and H. Wagner, `"Nearest neighbour search with Bregman
+   divergences using kd-trees" <https://arxiv.org/abs/2502.13425>`_, 2025.
 
 .. _classification:
 
@@ -478,7 +505,7 @@ Alternatively, the user can work with the :class:`BallTree` class directly.
 
       >>> from sklearn.neighbors import KDTree
       >>> print(sorted(KDTree.valid_metrics))
-      ['chebyshev', 'cityblock', 'euclidean', 'infinity', 'l1', 'l2', 'manhattan', 'minkowski', 'p']
+      ['chebyshev', 'cityblock', 'dis', 'dkl', 'euclidean', 'infinity', 'is', 'kl', 'l1', 'l2', 'manhattan', 'minkowski', 'p']
 
 .. _nearest_centroid_classifier:
 

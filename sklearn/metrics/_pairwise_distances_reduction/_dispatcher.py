@@ -8,7 +8,12 @@ import numpy as np
 from scipy.sparse import issparse
 
 from sklearn import get_config
-from sklearn.metrics._dist_metrics import BOOL_METRICS, METRIC_MAPPING64, DistanceMetric
+from sklearn.metrics._dist_metrics import (
+    BOOL_METRICS,
+    BREGMAN_DIVERGENCES,
+    METRIC_MAPPING64,
+    DistanceMetric,
+)
 from sklearn.metrics._pairwise_distances_reduction._argkmin import ArgKmin32, ArgKmin64
 from sklearn.metrics._pairwise_distances_reduction._argkmin_classmode import (
     ArgKminClassMode32,
@@ -76,6 +81,8 @@ class BaseDistancesReductionDispatcher:
             # TODO: implement a stable simultaneous_sort.
             "hamming",
             *BOOL_METRICS,
+            # Asymmetric, no sparse support: only KDTree handles these.
+            *BREGMAN_DIVERGENCES,
         }
         return sorted(({"sqeuclidean"} | set(METRIC_MAPPING64.keys())) - excluded)
 

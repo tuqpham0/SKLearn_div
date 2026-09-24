@@ -9,12 +9,61 @@ implementation_specific_values = [
 ]
 
 }}
-from libc.math cimport sqrt, exp
+from libc.math cimport sqrt, exp, log
 
 from sklearn.utils._typedefs cimport float64_t, float32_t, int32_t, intp_t
 
 cdef class DistanceMetric:
     pass
+
+
+######################################################################
+# Decomposable Bregman divergences
+#
+#  A decomposable Bregman divergence is a sum of one-dimensional
+#  components, one per coordinate. The point-to-point divergence and the
+#  point-to-box bounds of the KD tree are both built from these components,
+#  so they live here, inline, shared by the metric classes and the tree.
+#  In every component the first argument is the query coordinate and the
+#  second the data coordinate, the argument order of `DistanceMetric.dist`
+#  and of the tree queries.
+cdef enum BregmanKind:
+    BREGMAN_NONE = 0
+    BREGMAN_KL = 1
+    BREGMAN_DUAL_KL = 2
+    BREGMAN_IS = 3
+    BREGMAN_DUAL_IS = 4
+
+
+cdef inline float64_t kl_component(float64_t q, float64_t p) noexcept nogil:
+    # one coordinate of the generalised KL divergence D_KL(q || p)
+    if q == 0:
+        # 0 log 0 := 0
+        return p
+    return q * log(q / p) - q + p
+
+
+cdef inline float64_t is_component(float64_t q, float64_t p) noexcept nogil:
+    # one coordinate of the Itakura-Saito divergence D_IS(q || p)
+    cdef float64_t r = q / p
+    return r - log(r) - 1
+
+
+cdef inline float64_t bregman_component(
+    int kind,
+    float64_t q,
+    float64_t p,
+) noexcept nogil:
+    # component of the divergence `kind` from query coordinate q to data
+    # coordinate p
+    if kind == BREGMAN_KL:
+        return kl_component(q, p)
+    elif kind == BREGMAN_DUAL_KL:
+        return kl_component(p, q)
+    elif kind == BREGMAN_IS:
+        return is_component(q, p)
+    else:
+        return is_component(p, q)
 
 {{for name_suffix, INPUT_DTYPE_t, INPUT_DTYPE in implementation_specific_values}}
 
@@ -148,5 +197,11 @@ cdef class DistanceMetric{{name_suffix}}(DistanceMetric):
     cdef {{INPUT_DTYPE_t}} _rdist_to_dist(self, {{INPUT_DTYPE_t}} rdist) except -1 nogil
 
     cdef {{INPUT_DTYPE_t}} _dist_to_rdist(self, {{INPUT_DTYPE_t}} dist) except -1 nogil
+
+
+cdef class BregmanDivergence{{name_suffix}}(DistanceMetric{{name_suffix}}):
+    # Which decomposable divergence this is, one of the BregmanKind values.
+    # The KD tree reads it to select the matching node bounds.
+    cdef readonly int kind
 
 {{endfor}}

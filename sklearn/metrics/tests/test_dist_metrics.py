@@ -429,3 +429,109 @@ def test_minkowski_metric_validate_bad_p_parameter():
     msg = "p must be greater than 0"
     with pytest.raises(ValueError, match=msg):
         DistanceMetric.get_metric("minkowski", p=0)
+
+
+# ---------------------------------------------------------------------------
+# Decomposable Bregman divergences
+
+BREGMAN_DIVERGENCES = ["kl", "dkl", "is", "dis"]
+
+
+def bregman_reference(metric, X, Y):
+    """Divergence from each row of X to each row of Y, computed with numpy."""
+    X = X[:, None, :]
+    Y = Y[None, :, :]
+    if metric == "kl":
+        return np.sum(X * np.log(X / Y) - X + Y, axis=-1)
+    if metric == "dkl":
+        return np.sum(Y * np.log(Y / X) - Y + X, axis=-1)
+    if metric == "is":
+        r = X / Y
+        return np.sum(r - np.log(r) - 1, axis=-1)
+    if metric == "dis":
+        r = Y / X
+        return np.sum(r - np.log(r) - 1, axis=-1)
+    raise ValueError(metric)
+
+
+X_pos64 = rng.uniform(0.1, 2.0, size=(n1, d))
+Y_pos64 = rng.uniform(0.1, 2.0, size=(n2, d))
+X_pos32 = X_pos64.astype("float32")
+Y_pos32 = Y_pos64.astype("float32")
+
+
+@pytest.mark.parametrize("metric", BREGMAN_DIVERGENCES)
+@pytest.mark.parametrize("X, Y", [(X_pos64, Y_pos64), (X_pos32, Y_pos32)])
+def test_bregman_divergence_cdist(metric, X, Y):
+    dm = DistanceMetric.get_metric(metric, X.dtype)
+    rtol = 1e-5 if X.dtype == np.float32 else 1e-12
+    assert_allclose(dm.pairwise(X, Y), bregman_reference(metric, X, Y), rtol=rtol)
+
+
+@pytest.mark.parametrize("metric", BREGMAN_DIVERGENCES)
+def test_bregman_divergence_pdist_asymmetric(metric):
+    dm = DistanceMetric.get_metric(metric)
+    D = dm.pairwise(X_pos64)
+    assert_allclose(D, bregman_reference(metric, X_pos64, X_pos64), rtol=1e-12)
+    # a divergence is not symmetric and every ordered pair is evaluated
+    assert not np.allclose(D, D.T)
+    assert_allclose(np.diag(D), 0, atol=1e-12)
+
+
+@pytest.mark.parametrize("metric, dual", [("kl", "dkl"), ("is", "dis")])
+def test_bregman_divergence_dual_is_transpose(metric, dual):
+    D = DistanceMetric.get_metric(metric).pairwise(X_pos64, Y_pos64)
+    D_dual = DistanceMetric.get_metric(dual).pairwise(Y_pos64, X_pos64)
+    assert_allclose(D, D_dual.T, rtol=1e-12)
+
+
+@pytest.mark.parametrize("metric", BREGMAN_DIVERGENCES)
+def test_bregman_divergence_reduced_distance_is_identity(metric):
+    dm = DistanceMetric.get_metric(metric)
+    D = dm.pairwise(X_pos64, Y_pos64)
+    assert_allclose(dm.dist_to_rdist(D), D)
+    assert_allclose(dm.rdist_to_dist(D), D)
+
+
+def test_kl_divergence_zero_conventions():
+    dm = DistanceMetric.get_metric("kl")
+    # 0 log 0 = 0 in the first argument: only the second argument remains
+    assert_allclose(dm.pairwise([[0.0, 0.0]], [[0.5, 1.5]]), [[2.0]])
+    # a zero in the second argument facing a positive coordinate is infinite
+    assert np.isinf(dm.pairwise([[0.5, 1.0]], [[0.0, 1.0]])[0, 0])
+    assert_allclose(dm.pairwise([[0.0, 1.0]], [[0.0, 1.0]]), [[0.0]])
+
+
+@pytest.mark.parametrize("metric", BREGMAN_DIVERGENCES)
+@pytest.mark.parametrize("csr_container", CSR_CONTAINERS)
+def test_bregman_divergence_validate_data(metric, csr_container):
+    dm = DistanceMetric.get_metric(metric)
+    dm._validate_data(X_pos64)
+    with pytest.raises(ValueError, match="non-negative|strictly positive"):
+        dm._validate_data(-X_pos64)
+    with pytest.raises(ValueError, match="sparse"):
+        dm._validate_data(csr_container(X_pos64))
+    X_with_zero = X_pos64.copy()
+    X_with_zero[0, 0] = 0.0
+    if metric in ("is", "dis"):
+        with pytest.raises(ValueError, match="strictly positive"):
+            dm._validate_data(X_with_zero)
+    else:
+        dm._validate_data(X_with_zero)
+
+
+@pytest.mark.parametrize("metric", BREGMAN_DIVERGENCES)
+@pytest.mark.parametrize("csr_container", CSR_CONTAINERS)
+def test_bregman_divergence_sparse_unsupported(metric, csr_container):
+    dm = DistanceMetric.get_metric(metric)
+    with pytest.raises(NotImplementedError, match="sparse"):
+        dm.pairwise(csr_container(X_pos64), csr_container(Y_pos64))
+
+
+@pytest.mark.parametrize("metric", BREGMAN_DIVERGENCES)
+@pytest.mark.parametrize("X, Y", [(X_pos64, Y_pos64), (X_pos32, Y_pos32)])
+def test_bregman_divergence_pickle(metric, X, Y):
+    dm = DistanceMetric.get_metric(metric, X.dtype)
+    dm2 = pickle.loads(pickle.dumps(dm))
+    assert dm2.kind == dm.kind
+    assert_allclose(dm2.pairwise(X, Y), dm.pairwise(X, Y))

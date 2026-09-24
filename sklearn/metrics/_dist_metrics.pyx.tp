@@ -51,6 +51,12 @@ if sp_base_version < parse_version("1.17"):
 if sp_base_version >= parse_version("1.15"):
     DEPRECATED_METRICS.append("sokalmichener")
 
+# Identifiers of the decomposable Bregman divergences. They are asymmetric and
+# not metrics: only KDTree supports them, and the pairwise-distance reductions
+# (which assume a metric and sparse support) exclude them.
+BREGMAN_DIVERGENCES = ["kl", "dkl", "is", "dis"]
+
+
 def get_valid_metric_ids(L):
     """Given an iterable of metric class names or class identifiers,
     return a list of metric IDs which map to those classes.
@@ -105,6 +111,22 @@ cdef class DistanceMetric:
     "seuclidean"    SEuclideanDistance    V         ``sqrt(sum((x - y)^2 / V))``
     "mahalanobis"   MahalanobisDistance   V or VI   ``sqrt((x - y)' V^-1 (x - y))``
     ==============  ====================  ========  ===============================
+
+    **Decomposable Bregman divergences:**  ``D(x, y)`` is the divergence
+    *from* the first argument ``x`` *to* the second ``y``. These are not
+    metrics: they are asymmetric and do not satisfy the triangle inequality,
+    so they are supported by :class:`~sklearn.neighbors.KDTree` but not by
+    :class:`~sklearn.neighbors.BallTree`. Inputs must be non-negative
+    ("kl", "dkl") or strictly positive ("is", "dis").
+
+    ==========  ==========================  ==================================
+    identifier  class name                  distance function
+    ----------  --------------------------  ----------------------------------
+    "kl"        KLDivergence                ``sum(x log(x / y) - x + y)``
+    "dkl"       DualKLDivergence            ``sum(y log(y / x) - y + x)``
+    "is"        ItakuraSaitoDivergence      ``sum(x / y - log(x / y) - 1)``
+    "dis"       DualItakuraSaitoDivergence  ``sum(y / x - log(y / x) - 1)``
+    ==========  ==========================  ==================================
 
     **Metrics intended for two-dimensional vector spaces:**  Note that the haversine
     distance metric requires data in the form of [latitude, longitude] and both
@@ -241,6 +263,10 @@ METRIC_MAPPING{{name_suffix}} = {
     'sokalmichener': SokalMichenerDistance{{name_suffix}},
     'sokalsneath': SokalSneathDistance{{name_suffix}},
     'haversine': HaversineDistance{{name_suffix}},
+    'kl': KLDivergence{{name_suffix}},
+    'dkl': DualKLDivergence{{name_suffix}},
+    'is': ItakuraSaitoDivergence{{name_suffix}},
+    'dis': DualItakuraSaitoDivergence{{name_suffix}},
     'pyfunc': PyFuncDistance{{name_suffix}},
 }
 
@@ -294,6 +320,22 @@ cdef class DistanceMetric{{name_suffix}}(DistanceMetric):
     "seuclidean"    SEuclideanDistance    V         ``sqrt(sum((x - y)^2 / V))``
     "mahalanobis"   MahalanobisDistance   V or VI   ``sqrt((x - y)' V^-1 (x - y))``
     ==============  ====================  ========  ===============================
+
+    **Decomposable Bregman divergences:**  ``D(x, y)`` is the divergence
+    *from* the first argument ``x`` *to* the second ``y``. These are not
+    metrics: they are asymmetric and do not satisfy the triangle inequality,
+    so they are supported by :class:`~sklearn.neighbors.KDTree` but not by
+    :class:`~sklearn.neighbors.BallTree`. Inputs must be non-negative
+    ("kl", "dkl") or strictly positive ("is", "dis").
+
+    ==========  ==========================  ==================================
+    identifier  class name                  distance function
+    ----------  --------------------------  ----------------------------------
+    "kl"        KLDivergence                ``sum(x log(x / y) - x + y)``
+    "dkl"       DualKLDivergence            ``sum(y log(y / x) - y + x)``
+    "is"        ItakuraSaitoDivergence      ``sum(x / y - log(x / y) - 1)``
+    "dis"       DualItakuraSaitoDivergence  ``sum(y / x - log(y / x) - 1)``
+    ==========  ==========================  ==================================
 
     **Metrics intended for two-dimensional vector spaces:**  Note that the haversine
     distance metric requires data in the form of [latitude, longitude] and both
@@ -2743,6 +2785,214 @@ cdef class HaversineDistance{{name_suffix}}(DistanceMetric{{name_suffix}}):
         sin_1 = sin(0.5 * (x1_1 - x2_1))
 
         return (sin_0 * sin_0 + cos(x1_0) * cos(x2_0) * sin_1 * sin_1)
+
+#------------------------------------------------------------
+# Decomposable Bregman divergences
+#  D(x, y) = sum_i c(x_i, y_i) for a one-dimensional component c
+cdef class BregmanDivergence{{name_suffix}}(DistanceMetric{{name_suffix}}):
+    r"""Base class for decomposable Bregman divergences.
+
+    A decomposable Bregman divergence is a sum of one-dimensional Bregman
+    divergences, one per coordinate. It is computed *from* the first
+    argument *to* the second, :math:`D(x, y) = D_F(x \| y)`, and is in
+    general asymmetric. It is not a metric and does not satisfy the
+    triangle inequality, so it is supported by
+    :class:`~sklearn.neighbors.KDTree`, whose node bounds decompose over
+    coordinates, but not by :class:`~sklearn.neighbors.BallTree`.
+
+    The rank-preserving surrogate distance is the divergence itself.
+
+    References
+    ----------
+    .. [1] T. Pham and H. Wagner, "Nearest neighbour search with Bregman
+           divergences using kd-trees", arXiv:2502.13425 (2025).
+    """
+    def __init__(self):
+        if self.__class__ is BregmanDivergence{{name_suffix}}:
+            raise NotImplementedError(
+                "BregmanDivergence{{name_suffix}} is an abstract class"
+            )
+        # A KDTree node records a "radius" as the p-norm of its half-widths.
+        # A divergence has no p; use their sum (p = 1). The radius only
+        # orders nodes when a dual-tree query decides which one to split.
+        self.p = 1
+
+    def __getstate__(self):
+        return (float(self.p), np.asarray(self.vec), np.asarray(self.mat),
+                int(self.kind))
+
+    def __setstate__(self, state):
+        super().__setstate__(state[:3])
+        self.kind = state[3]
+
+    def _validate_data(self, X):
+        if issparse(X):
+            raise ValueError(
+                f"{self.__class__.__name__} does not support sparse input."
+            )
+        X = np.asarray(X)
+        if self.kind in (BREGMAN_IS, BREGMAN_DUAL_IS):
+            if np.any(X <= 0):
+                raise ValueError(
+                    f"{self.__class__.__name__} requires strictly positive "
+                    "input."
+                )
+        elif np.any(X < 0):
+            raise ValueError(
+                f"{self.__class__.__name__} requires non-negative input."
+            )
+
+    # not inline: the concrete divergences override it with a specialised loop
+    cdef {{INPUT_DTYPE_t}} dist(
+        self,
+        const {{INPUT_DTYPE_t}}* x1,
+        const {{INPUT_DTYPE_t}}* x2,
+        intp_t size,
+    ) except -1 nogil:
+        cdef float64_t d = 0
+        cdef intp_t j
+        for j in range(size):
+            d += bregman_component(self.kind, x1[j], x2[j])
+        return d
+
+    cdef inline {{INPUT_DTYPE_t}} dist_csr(
+        self,
+        const {{INPUT_DTYPE_t}}* x1_data,
+        const int32_t* x1_indices,
+        const {{INPUT_DTYPE_t}}* x2_data,
+        const int32_t* x2_indices,
+        const int32_t x1_start,
+        const int32_t x1_end,
+        const int32_t x2_start,
+        const int32_t x2_end,
+        const intp_t size,
+    ) except -1 nogil:
+        with gil:
+            raise NotImplementedError(
+                "Bregman divergences do not support sparse input."
+            )
+
+    cdef int pdist(
+        self,
+        const {{INPUT_DTYPE_t}}[:, ::1] X,
+        {{INPUT_DTYPE_t}}[:, ::1] D,
+    ) except -1:
+        """Compute the pairwise divergences between points in X.
+
+        Unlike a metric, the result is not symmetric, so every ordered pair
+        is evaluated.
+        """
+        cdef intp_t i1, i2
+        for i1 in range(X.shape[0]):
+            for i2 in range(X.shape[0]):
+                D[i1, i2] = self.dist(&X[i1, 0], &X[i2, 0], X.shape[1])
+        return 0
+
+
+cdef class KLDivergence{{name_suffix}}(BregmanDivergence{{name_suffix}}):
+    r"""Generalised Kullback-Leibler divergence
+
+    .. math::
+       D(x, y) = \sum_i \left( x_i \log \frac{x_i}{y_i} - x_i + y_i \right)
+
+    computed from ``x`` to ``y``. Inputs must be non-negative. The convention
+    :math:`0 \log 0 = 0` applies to ``x``; a zero in ``y`` facing a positive
+    coordinate of ``x`` gives an infinite divergence. For vectors on the
+    probability simplex this is the Kullback-Leibler divergence.
+    """
+    def __init__(self):
+        super().__init__()
+        self.kind = BREGMAN_KL
+
+    cdef inline {{INPUT_DTYPE_t}} dist(
+        self,
+        const {{INPUT_DTYPE_t}}* x1,
+        const {{INPUT_DTYPE_t}}* x2,
+        intp_t size,
+    ) except -1 nogil:
+        cdef float64_t d = 0
+        cdef intp_t j
+        for j in range(size):
+            d += kl_component(x1[j], x2[j])
+        return d
+
+
+cdef class DualKLDivergence{{name_suffix}}(BregmanDivergence{{name_suffix}}):
+    r"""Dual (reversed) generalised Kullback-Leibler divergence
+
+    .. math::
+       D(x, y) = \sum_i \left( y_i \log \frac{y_i}{x_i} - y_i + x_i \right)
+
+    that is, the generalised Kullback-Leibler divergence from ``y`` to ``x``.
+    Inputs must be non-negative.
+    """
+    def __init__(self):
+        super().__init__()
+        self.kind = BREGMAN_DUAL_KL
+
+    cdef inline {{INPUT_DTYPE_t}} dist(
+        self,
+        const {{INPUT_DTYPE_t}}* x1,
+        const {{INPUT_DTYPE_t}}* x2,
+        intp_t size,
+    ) except -1 nogil:
+        cdef float64_t d = 0
+        cdef intp_t j
+        for j in range(size):
+            d += kl_component(x2[j], x1[j])
+        return d
+
+
+cdef class ItakuraSaitoDivergence{{name_suffix}}(BregmanDivergence{{name_suffix}}):
+    r"""Itakura-Saito divergence
+
+    .. math::
+       D(x, y) = \sum_i \left( \frac{x_i}{y_i} - \log \frac{x_i}{y_i} - 1 \right)
+
+    computed from ``x`` to ``y``. Inputs must be strictly positive.
+    """
+    def __init__(self):
+        super().__init__()
+        self.kind = BREGMAN_IS
+
+    cdef inline {{INPUT_DTYPE_t}} dist(
+        self,
+        const {{INPUT_DTYPE_t}}* x1,
+        const {{INPUT_DTYPE_t}}* x2,
+        intp_t size,
+    ) except -1 nogil:
+        cdef float64_t d = 0
+        cdef intp_t j
+        for j in range(size):
+            d += is_component(x1[j], x2[j])
+        return d
+
+
+cdef class DualItakuraSaitoDivergence{{name_suffix}}(BregmanDivergence{{name_suffix}}):
+    r"""Dual (reversed) Itakura-Saito divergence
+
+    .. math::
+       D(x, y) = \sum_i \left( \frac{y_i}{x_i} - \log \frac{y_i}{x_i} - 1 \right)
+
+    that is, the Itakura-Saito divergence from ``y`` to ``x``. Inputs must
+    be strictly positive.
+    """
+    def __init__(self):
+        super().__init__()
+        self.kind = BREGMAN_DUAL_IS
+
+    cdef inline {{INPUT_DTYPE_t}} dist(
+        self,
+        const {{INPUT_DTYPE_t}}* x1,
+        const {{INPUT_DTYPE_t}}* x2,
+        intp_t size,
+    ) except -1 nogil:
+        cdef float64_t d = 0
+        cdef intp_t j
+        for j in range(size):
+            d += is_component(x2[j], x1[j])
+        return d
+
 
 #------------------------------------------------------------
 # User-defined distance

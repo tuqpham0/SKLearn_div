@@ -5,7 +5,11 @@ import pickle
 
 import numpy as np
 import pytest
-from numpy.testing import assert_allclose, assert_array_almost_equal
+from numpy.testing import (
+    assert_allclose,
+    assert_array_almost_equal,
+    assert_array_equal,
+)
 
 from sklearn.metrics import DistanceMetric
 from sklearn.neighbors._ball_tree import (
@@ -294,3 +298,189 @@ def test_pickle(Cls, metric, protocol):
     assert_array_almost_equal(dist1, dist2)
 
     assert isinstance(tree2, Cls)
+
+
+# ---------------------------------------------------------------------------
+# Decomposable Bregman divergences (KDTree only)
+
+BREGMAN_METRICS = ["kl", "dkl", "is", "dis"]
+
+
+def bregman_reference(metric, Q, X):
+    """Divergence from each query row of Q to each data row of X."""
+    Q = Q[:, None, :]
+    X = X[None, :, :]
+    if metric == "kl":
+        return np.sum(Q * np.log(Q / X) - Q + X, axis=-1)
+    if metric == "dkl":
+        return np.sum(X * np.log(X / Q) - X + Q, axis=-1)
+    if metric == "is":
+        r = Q / X
+        return np.sum(r - np.log(r) - 1, axis=-1)
+    if metric == "dis":
+        r = X / Q
+        return np.sum(r - np.log(r) - 1, axis=-1)
+    raise ValueError(metric)
+
+
+def _positive_data(seed=0, n_samples=80, n_queries=15, n_features=DIMENSION):
+    rng = check_random_state(seed)
+    X = rng.uniform(0.05, 1.0, (n_samples, n_features))
+    Y = rng.uniform(0.05, 1.0, (n_queries, n_features))
+    return X, Y
+
+
+@pytest.mark.parametrize("metric", BREGMAN_METRICS)
+@pytest.mark.parametrize("k", (1, 3, 5))
+@pytest.mark.parametrize("dualtree", (True, False))
+@pytest.mark.parametrize("breadth_first", (True, False))
+@pytest.mark.parametrize("leaf_size", (1, 5))
+def test_kd_tree_query_bregman(metric, k, dualtree, breadth_first, leaf_size):
+    X, Y = _positive_data()
+
+    tree = KDTree(X, leaf_size=leaf_size, metric=metric)
+    dist1, ind1 = tree.query(Y, k, dualtree=dualtree, breadth_first=breadth_first)
+
+    D = bregman_reference(metric, Y, X)
+    ind2 = np.argsort(D, axis=1)[:, :k]
+    dist2 = np.take_along_axis(D, ind2, axis=1)
+
+    assert_allclose(dist1, dist2, rtol=1e-10)
+    # continuous random data: no ties, so the indices must agree too
+    assert_array_equal(ind1, ind2)
+
+
+def test_kd_tree_query_bregman_measured_from_query():
+    # the tree measures the divergence from the query to the training
+    # points; the dual divergence reverses the direction, and the two
+    # disagree because a divergence is asymmetric
+    X, Y = _positive_data(seed=1)
+    d_kl, i_kl = KDTree(X, metric="kl").query(Y, 3)
+    d_dkl, i_dkl = KDTree(X, metric="dkl").query(Y, 3)
+
+    D_kl = bregman_reference("kl", Y, X)
+    D_dkl = bregman_reference("dkl", Y, X)
+    assert_allclose(d_kl, np.take_along_axis(D_kl, i_kl, axis=1))
+    assert_allclose(d_dkl, np.take_along_axis(D_dkl, i_dkl, axis=1))
+    assert not np.allclose(d_kl, d_dkl)
+
+
+@pytest.mark.parametrize("metric", BREGMAN_METRICS)
+@pytest.mark.parametrize("dtype", (np.float64, np.float32))
+def test_kd_tree_query_bregman_dtype(metric, dtype):
+    X, Y = _positive_data(seed=2)
+    X = X.astype(dtype)
+    Y = Y.astype(dtype)
+    tree = KDTree(X, leaf_size=3, metric=metric)
+    dist, ind = tree.query(Y, 3)
+    D = bregman_reference(metric, Y.astype(np.float64), X.astype(np.float64))
+    ind_ref = np.argsort(D, axis=1)[:, :3]
+    rtol = 1e-4 if dtype == np.float32 else 1e-10
+    assert_allclose(dist, np.take_along_axis(D, ind_ref, axis=1), rtol=rtol)
+
+
+@pytest.mark.parametrize("metric", BREGMAN_METRICS)
+@pytest.mark.parametrize("leaf_size", (1, 4))
+def test_kd_tree_query_radius_bregman(metric, leaf_size):
+    X, Y = _positive_data(seed=3)
+    D = bregman_reference(metric, Y, X)
+    r = np.median(D)
+
+    tree = KDTree(X, leaf_size=leaf_size, metric=metric)
+    ind, dist = tree.query_radius(Y, r, return_distance=True)
+    counts = tree.query_radius(Y, r, count_only=True)
+
+    for i in range(Y.shape[0]):
+        expected = np.flatnonzero(D[i] <= r)
+        assert_array_equal(np.sort(ind[i]), expected)
+        assert_allclose(np.sort(dist[i]), np.sort(D[i][expected]), rtol=1e-10)
+        assert counts[i] == expected.size
+
+
+@pytest.mark.parametrize("metric", BREGMAN_METRICS)
+@pytest.mark.parametrize("dualtree", (True, False))
+def test_kd_tree_two_point_bregman(metric, dualtree):
+    X, Y = _positive_data(seed=4)
+    D = bregman_reference(metric, Y, X)
+    r = np.linspace(D.min(), D.max(), 10)
+
+    tree = KDTree(X, leaf_size=2, metric=metric)
+    counts = tree.two_point_correlation(Y, r, dualtree=dualtree)
+    expected = [(D <= ri).sum() for ri in r]
+    assert_array_equal(counts, expected)
+
+
+@pytest.mark.parametrize("metric", BREGMAN_METRICS)
+@pytest.mark.parametrize("protocol", (0, 1, 2))
+def test_kd_tree_pickle_bregman(metric, protocol):
+    X, Y = _positive_data(seed=5)
+    tree1 = KDTree(X, leaf_size=2, metric=metric)
+    dist1, ind1 = tree1.query(Y, 3)
+
+    tree2 = pickle.loads(pickle.dumps(tree1, protocol=protocol))
+    dist2, ind2 = tree2.query(Y, 3)
+
+    assert_allclose(dist1, dist2)
+    assert_array_equal(ind1, ind2)
+
+
+@pytest.mark.parametrize("metric", BREGMAN_METRICS)
+def test_kd_tree_bregman_rejects_invalid_data(metric):
+    X, _ = _positive_data(seed=6)
+    with pytest.raises(ValueError, match="non-negative|strictly positive"):
+        KDTree(-X, metric=metric)
+
+
+@pytest.mark.parametrize("metric", BREGMAN_METRICS)
+def test_ball_tree_rejects_bregman(metric):
+    X, _ = _positive_data(seed=7)
+    with pytest.raises(ValueError, match="not valid for BallTree"):
+        BallTree(X, metric=metric)
+
+
+# ---------------------------------------------------------------------------
+# (1 + eps)-approximate queries
+
+
+@pytest.mark.parametrize(
+    "metric", ["euclidean", "manhattan", "chebyshev", "minkowski", "kl", "is"]
+)
+@pytest.mark.parametrize("eps", (0.0, 0.25, 1.0, 4.0))
+@pytest.mark.parametrize("dualtree", (True, False))
+@pytest.mark.parametrize("breadth_first", (True, False))
+def test_kd_tree_query_eps(metric, eps, dualtree, breadth_first):
+    X, Y = _positive_data(seed=8, n_samples=200, n_queries=30)
+    kwargs = METRICS.get(metric, {})
+    k = 5
+
+    tree = KDTree(X, leaf_size=2, metric=metric, **kwargs)
+    dist_exact, _ = tree.query(Y, k)
+    dist_eps, _ = tree.query(
+        Y, k, dualtree=dualtree, breadth_first=breadth_first, eps=eps
+    )
+
+    # the j-th neighbor found is at most (1 + eps) times as far as the true
+    # j-th nearest neighbor, and never closer
+    assert np.all(dist_eps >= dist_exact - 1e-12)
+    assert np.all(dist_eps <= (1 + eps) * dist_exact + 1e-12)
+    if eps == 0:
+        assert_allclose(dist_eps, dist_exact)
+
+
+def test_kd_tree_query_eps_is_approximate():
+    # a large eps prunes enough that some returned neighbors are genuinely
+    # approximate, while still respecting the (1 + eps) bound
+    X, Y = _positive_data(seed=9, n_samples=2000, n_queries=100, n_features=8)
+    tree = KDTree(X, leaf_size=5)
+
+    d0, _ = tree.query(Y, 5)
+    d1, _ = tree.query(Y, 5, eps=2.0)
+    assert np.all(d1 <= 3 * d0 + 1e-12)
+    assert np.any(d1 > d0 + 1e-12)
+
+
+def test_kd_tree_query_eps_validation():
+    X, Y = _positive_data(seed=10)
+    tree = KDTree(X)
+    with pytest.raises(ValueError, match="eps must be non-negative"):
+        tree.query(Y, 1, eps=-0.5)

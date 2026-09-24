@@ -31,7 +31,13 @@ VALID_METRICS{{name_suffix}} = [
     'EuclideanDistance{{name_suffix}}',
     'ManhattanDistance{{name_suffix}}',
     'ChebyshevDistance{{name_suffix}}',
-    'MinkowskiDistance{{name_suffix}}'
+    'MinkowskiDistance{{name_suffix}}',
+    # decomposable Bregman divergences: not metrics, but their node bounds
+    # decompose over coordinates like the Minkowski ones
+    'KLDivergence{{name_suffix}}',
+    'DualKLDivergence{{name_suffix}}',
+    'ItakuraSaitoDivergence{{name_suffix}}',
+    'DualItakuraSaitoDivergence{{name_suffix}}',
 ]
 
 {{endfor}}
@@ -57,6 +63,16 @@ cdef class KDTree{{name_suffix}}(BinaryTree{{name_suffix}}):
 #   relative rankings of the true distance.  For example, the reduced
 #   distance for the Euclidean metric is the squared-euclidean distance.
 #   For some metrics, the reduced distance is simply the distance.
+#
+#   For a decomposable Bregman divergence the same bounds apply with the
+#   per-coordinate term |q_j - x_j|^p replaced by the divergence's
+#   one-dimensional component c(q_j, x_j), measured from the query
+#   coordinate q_j to the data coordinate x_j. Each component decreases
+#   towards q_j and increases away from it (it is a Bregman divergence of
+#   a strictly convex generator), so over an interval it is smallest at
+#   the coordinate-wise clamp of q_j and largest at an end point, exactly
+#   as for Minkowski metrics. Only the term differs; see the Bregman
+#   kd-tree of Pham and Wagner (arXiv:2502.13425) and the bann package.
 
 {{for name_suffix, INPUT_DTYPE_t, INPUT_DTYPE in implementation_specific_values}}
 
@@ -120,6 +136,119 @@ cdef int init_node{{name_suffix}}(
     return 0
 
 
+cdef inline float64_t bregman_min_rdist{{name_suffix}}(
+    BinaryTree{{name_suffix}} tree,
+    intp_t i_node,
+    const {{INPUT_DTYPE_t}}* pt,
+) noexcept nogil:
+    """Minimum divergence from a query point to the box of a node.
+
+    The closest point of the box is the coordinate-wise clamp of the query,
+    so the bound is the sum of the components to the clamped coordinates.
+    """
+    cdef intp_t n_features = tree.data.shape[1]
+    cdef int kind = tree.bregman
+    cdef float64_t lo, hi, rdist = 0.0
+    cdef intp_t j
+
+    for j in range(n_features):
+        lo = tree.node_bounds[0, i_node, j]
+        hi = tree.node_bounds[1, i_node, j]
+        if pt[j] < lo:
+            rdist += bregman_component(kind, pt[j], lo)
+        elif pt[j] > hi:
+            rdist += bregman_component(kind, pt[j], hi)
+
+    return rdist
+
+
+cdef inline float64_t bregman_max_rdist{{name_suffix}}(
+    BinaryTree{{name_suffix}} tree,
+    intp_t i_node,
+    const {{INPUT_DTYPE_t}}* pt,
+) noexcept nogil:
+    """Maximum divergence from a query point to the box of a node.
+
+    Each component is largest at one of the two ends of the interval.
+    """
+    cdef intp_t n_features = tree.data.shape[1]
+    cdef int kind = tree.bregman
+    cdef float64_t lo, hi, rdist = 0.0
+    cdef intp_t j
+
+    for j in range(n_features):
+        lo = tree.node_bounds[0, i_node, j]
+        hi = tree.node_bounds[1, i_node, j]
+        rdist += fmax(bregman_component(kind, pt[j], lo),
+                      bregman_component(kind, pt[j], hi))
+
+    return rdist
+
+
+cdef inline float64_t bregman_min_rdist_dual{{name_suffix}}(
+    BinaryTree{{name_suffix}} tree1,
+    intp_t i_node1,
+    BinaryTree{{name_suffix}} tree2,
+    intp_t i_node2,
+) noexcept nogil:
+    """Minimum divergence from the box of a node of the query tree (tree2)
+    to the box of a node of the data tree (tree1).
+
+    Along a coordinate the component decreases as the two points approach
+    each other from either side, so when the intervals are disjoint the
+    minimum is attained at their facing end points, and it is 0 when they
+    overlap.
+    """
+    cdef intp_t n_features = tree1.data.shape[1]
+    cdef int kind = tree1.bregman
+    cdef float64_t lo1, hi1, lo2, hi2, rdist = 0.0
+    cdef intp_t j
+
+    for j in range(n_features):
+        lo1 = tree1.node_bounds[0, i_node1, j]
+        hi1 = tree1.node_bounds[1, i_node1, j]
+        lo2 = tree2.node_bounds[0, i_node2, j]
+        hi2 = tree2.node_bounds[1, i_node2, j]
+        if hi2 < lo1:
+            rdist += bregman_component(kind, hi2, lo1)
+        elif lo2 > hi1:
+            rdist += bregman_component(kind, lo2, hi1)
+
+    return rdist
+
+
+cdef inline float64_t bregman_max_rdist_dual{{name_suffix}}(
+    BinaryTree{{name_suffix}} tree1,
+    intp_t i_node1,
+    BinaryTree{{name_suffix}} tree2,
+    intp_t i_node2,
+) noexcept nogil:
+    """Maximum divergence from the box of a node of the query tree (tree2)
+    to the box of a node of the data tree (tree1).
+
+    A component is convex in one argument and decreasing-then-increasing in
+    the other, so over a rectangle it is largest at one of the four corners.
+    """
+    cdef intp_t n_features = tree1.data.shape[1]
+    cdef int kind = tree1.bregman
+    cdef float64_t lo1, hi1, lo2, hi2, rdist = 0.0
+    cdef intp_t j
+
+    for j in range(n_features):
+        lo1 = tree1.node_bounds[0, i_node1, j]
+        hi1 = tree1.node_bounds[1, i_node1, j]
+        lo2 = tree2.node_bounds[0, i_node2, j]
+        hi2 = tree2.node_bounds[1, i_node2, j]
+        rdist += fmax(
+            fmax(bregman_component(kind, lo2, lo1),
+                 bregman_component(kind, lo2, hi1)),
+            fmax(bregman_component(kind, hi2, lo1),
+                 bregman_component(kind, hi2, hi1)),
+        )
+
+    return rdist
+
+
 cdef float64_t min_rdist{{name_suffix}}(
     BinaryTree{{name_suffix}} tree,
     intp_t i_node,
@@ -129,6 +258,9 @@ cdef float64_t min_rdist{{name_suffix}}(
     cdef intp_t n_features = tree.data.shape[1]
     cdef float64_t d, d_lo, d_hi, rdist=0.0
     cdef intp_t j
+
+    if tree.bregman:
+        return bregman_min_rdist{{name_suffix}}(tree, i_node, pt)
 
     if tree.dist_metric.p == INF:
         for j in range(n_features):
@@ -153,7 +285,7 @@ cdef float64_t min_dist{{name_suffix}}(
     const {{INPUT_DTYPE_t}}* pt,
 ) except -1:
     """Compute the minimum distance between a point and a node"""
-    if tree.dist_metric.p == INF:
+    if tree.bregman or tree.dist_metric.p == INF:
         return min_rdist{{name_suffix}}(tree, i_node, pt)
     else:
         return pow(
@@ -172,6 +304,9 @@ cdef float64_t max_rdist{{name_suffix}}(
 
     cdef float64_t d_lo, d_hi, rdist=0.0
     cdef intp_t j
+
+    if tree.bregman:
+        return bregman_max_rdist{{name_suffix}}(tree, i_node, pt)
 
     if tree.dist_metric.p == INF:
         for j in range(n_features):
@@ -192,7 +327,7 @@ cdef float64_t max_dist{{name_suffix}}(
     const {{INPUT_DTYPE_t}}* pt,
 ) except -1:
     """Compute the maximum distance between a point and a node"""
-    if tree.dist_metric.p == INF:
+    if tree.bregman or tree.dist_metric.p == INF:
         return max_rdist{{name_suffix}}(tree, i_node, pt)
     else:
         return pow(
@@ -216,6 +351,11 @@ cdef inline int min_max_dist{{name_suffix}}(
 
     min_dist[0] = 0.0
     max_dist[0] = 0.0
+
+    if tree.bregman:
+        min_dist[0] = bregman_min_rdist{{name_suffix}}(tree, i_node, pt)
+        max_dist[0] = bregman_max_rdist{{name_suffix}}(tree, i_node, pt)
+        return 0
 
     if tree.dist_metric.p == INF:
         for j in range(n_features):
@@ -252,6 +392,10 @@ cdef inline float64_t min_rdist_dual{{name_suffix}}(
 
     cdef float64_t d, d1, d2, rdist=0.0
     cdef intp_t j
+
+    if tree1.bregman:
+        return bregman_min_rdist_dual{{name_suffix}}(tree1, i_node1,
+                                                     tree2, i_node2)
 
     if tree1.dist_metric.p == INF:
         for j in range(n_features):
@@ -299,6 +443,10 @@ cdef inline float64_t max_rdist_dual{{name_suffix}}(
 
     cdef float64_t d1, d2, rdist=0.0
     cdef intp_t j
+
+    if tree1.bregman:
+        return bregman_max_rdist_dual{{name_suffix}}(tree1, i_node1,
+                                                     tree2, i_node2)
 
     if tree1.dist_metric.p == INF:
         for j in range(n_features):

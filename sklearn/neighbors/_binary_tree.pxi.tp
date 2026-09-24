@@ -199,6 +199,10 @@ from sklearn.metrics._dist_metrics cimport (
     euclidean_rdist32,
     euclidean_dist_to_rdist64,
     euclidean_dist_to_rdist32,
+    BregmanDivergence64,
+    BregmanDivergence32,
+    bregman_component,
+    BREGMAN_NONE,
 )
 
 from sklearn.neighbors._partition_nodes cimport partition_node_indices
@@ -281,6 +285,10 @@ metric : str or DistanceMetric64 object, default='minkowski'
     <https://docs.scipy.org/doc/scipy/reference/spatial.distance.html>`_ and
     the metrics listed in :class:`~sklearn.metrics.pairwise.distance_metrics` for
     more information on any distance metric.
+    The decomposable Bregman divergences "kl", "dkl", "is" and "dis" (see
+    :class:`~sklearn.metrics.DistanceMetric`) are accepted by KDTree only.
+    They are asymmetric and are measured from the query points to the
+    training points.
 
 Additional keywords are passed to the distance metric class.
 Note: Callable functions in the metric parameter are NOT supported for KDTree
@@ -824,6 +832,13 @@ _STATS_DEPRECATION = (
 VALID_METRIC_IDS{{name_suffix}} = get_valid_metric_ids(VALID_METRICS{{name_suffix}})
 
 
+cdef inline int bregman_kind{{name_suffix}}(DistanceMetric{{name_suffix}} metric):
+    """The BregmanKind of a metric, BREGMAN_NONE unless it is a divergence."""
+    if isinstance(metric, BregmanDivergence{{name_suffix}}):
+        return (<BregmanDivergence{{name_suffix}}> metric).kind
+    return BREGMAN_NONE
+
+
 ######################################################################
 # Binary Tree class
 cdef class BinaryTree{{name_suffix}}:
@@ -845,6 +860,9 @@ cdef class BinaryTree{{name_suffix}}:
 
     cdef DistanceMetric{{name_suffix}} dist_metric
     cdef int euclidean
+    # BregmanKind of dist_metric; BREGMAN_NONE (0) for a metric. The KD tree
+    # node bounds dispatch on it.
+    cdef int bregman
 
     # variables to keep track of building & querying stats
     cdef int n_trims
@@ -871,6 +889,7 @@ cdef class BinaryTree{{name_suffix}}:
         self.n_nodes = 0
 
         self.euclidean = False
+        self.bregman = BREGMAN_NONE
 
         self.n_trims = 0
         self.n_leaves = 0
@@ -894,6 +913,7 @@ cdef class BinaryTree{{name_suffix}}:
         self.dist_metric = DistanceMetric.get_metric(metric, dtype={{INPUT_DTYPE}}, **kwargs)
         self.euclidean = (self.dist_metric.__class__.__name__
                           == 'EuclideanDistance{{name_suffix}}')
+        self.bregman = bregman_kind{{name_suffix}}(self.dist_metric)
 
         metric = self.dist_metric.__class__.__name__
         if metric not in VALID_METRICS{{name_suffix}}:
@@ -984,6 +1004,7 @@ cdef class BinaryTree{{name_suffix}}:
 
         self.euclidean = (self.dist_metric.__class__.__name__
                           == 'EuclideanDistance64')
+        self.bregman = bregman_kind{{name_suffix}}(self.dist_metric)
         n_samples = self.data.shape[0]
         self._update_sample_weight(n_samples, sample_weight)
 
@@ -1147,10 +1168,10 @@ cdef class BinaryTree{{name_suffix}}:
 
     def query(self, X, k=1, return_distance=True,
               dualtree=False, breadth_first=False,
-              sort_results=True):
+              sort_results=True, eps=0.0):
         """
         query(X, k=1, return_distance=True,
-              dualtree=False, breadth_first=False)
+              dualtree=False, breadth_first=False, sort_results=True, eps=0.0)
 
         query the tree for the k nearest neighbors
 
@@ -1175,6 +1196,12 @@ cdef class BinaryTree{{name_suffix}}:
             if True, then distances and indices of each point are sorted
             on return, so that the first column contains the closest points.
             Otherwise, neighbors are returned in an arbitrary order.
+        eps : float, default=0.0
+            approximation factor. A node is skipped when the distance from
+            the query to the node is more than ``1 / (1 + eps)`` times the
+            distance to the current k-th neighbor, so the j-th neighbor
+            returned is at most ``(1 + eps)`` times as far as the true j-th
+            nearest neighbor. ``eps=0`` gives the exact result.
 
         Returns
         -------
@@ -1200,6 +1227,15 @@ cdef class BinaryTree{{name_suffix}}:
             raise ValueError("k must be less than or equal "
                              "to the number of training points")
 
+        if eps < 0:
+            raise ValueError("eps must be non-negative")
+
+        # The pruning tests compare reduced distances, so the (1 + eps)
+        # factor on distances becomes its reduced-distance counterpart:
+        # (1 + eps)^2 for Euclidean, (1 + eps)^p for Minkowski, and
+        # 1 + eps for a metric or divergence with no reduction.
+        cdef float64_t max_err = self.dist_metric._dist_to_rdist(1.0 + eps)
+
         self._prep_thread_locals()
 
         # flatten X, and save original shape information
@@ -1224,25 +1260,26 @@ cdef class BinaryTree{{name_suffix}}:
             other = self.__class__(np_Xarr, metric=self.dist_metric,
                                    leaf_size=self.leaf_size)
             if breadth_first:
-                self._query_dual_breadthfirst(other, heap, nodeheap)
+                self._query_dual_breadthfirst(other, heap, nodeheap, max_err)
             else:
                 reduced_dist_LB = min_rdist_dual{{name_suffix}}(self, 0, other, 0)
                 bounds = np.full(other.node_data.shape[0], np.inf)
                 self._query_dual_depthfirst(0, other, 0, bounds,
-                                            heap, reduced_dist_LB)
+                                            heap, reduced_dist_LB, max_err)
 
         else:
             pt = &Xarr[0, 0]
             if breadth_first:
                 for i in range(Xarr.shape[0]):
-                    self._query_single_breadthfirst(pt, i, heap, nodeheap)
+                    self._query_single_breadthfirst(pt, i, heap, nodeheap,
+                                                    max_err)
                     pt += Xarr.shape[1]
             else:
                 with nogil:
                     for i in range(Xarr.shape[0]):
                         reduced_dist_LB = min_rdist{{name_suffix}}(self, 0, pt)
                         self._query_single_depthfirst(0, pt, i, heap,
-                                                      reduced_dist_LB)
+                                                      reduced_dist_LB, max_err)
                         pt += Xarr.shape[1]
 
         distances, indices = heap.get_arrays(sort=sort_results)
@@ -1682,6 +1719,7 @@ cdef class BinaryTree{{name_suffix}}:
         intp_t i_pt,
         NeighborsHeap{{name_suffix}} heap,
         float64_t reduced_dist_LB,
+        float64_t max_err,
     ) except -1 nogil:
         """Recursive Single-tree k-neighbors query, depth-first approach"""
         cdef NodeData_t node_info = self.node_data[i_node]
@@ -1692,9 +1730,9 @@ cdef class BinaryTree{{name_suffix}}:
         cdef const {{INPUT_DTYPE_t}}* data = &self.data[0, 0]
 
         # ------------------------------------------------------------
-        # Case 1: query point is outside node radius:
-        #         trim it from the query
-        if reduced_dist_LB > heap.largest(i_pt):
+        # Case 1: query point is outside node radius (up to the
+        #         approximation factor): trim it from the query
+        if reduced_dist_LB * max_err > heap.largest(i_pt):
             tree_stats.n_trims += 1
 
         # ------------------------------------------------------------
@@ -1720,14 +1758,14 @@ cdef class BinaryTree{{name_suffix}}:
             # recursively query subnodes
             if reduced_dist_LB_1 <= reduced_dist_LB_2:
                 self._query_single_depthfirst(i1, pt, i_pt, heap,
-                                              reduced_dist_LB_1)
+                                              reduced_dist_LB_1, max_err)
                 self._query_single_depthfirst(i2, pt, i_pt, heap,
-                                              reduced_dist_LB_2)
+                                              reduced_dist_LB_2, max_err)
             else:
                 self._query_single_depthfirst(i2, pt, i_pt, heap,
-                                              reduced_dist_LB_2)
+                                              reduced_dist_LB_2, max_err)
                 self._query_single_depthfirst(i1, pt, i_pt, heap,
-                                              reduced_dist_LB_1)
+                                              reduced_dist_LB_1, max_err)
         return 0
 
     cdef int _query_single_breadthfirst(
@@ -1736,6 +1774,7 @@ cdef class BinaryTree{{name_suffix}}:
         intp_t i_pt,
         NeighborsHeap{{name_suffix}} heap,
         NodeHeap nodeheap,
+        float64_t max_err,
     ) except -1:
         """Non-recursive single-tree k-neighbors query, breadth-first search"""
         cdef intp_t i, i_node
@@ -1756,9 +1795,9 @@ cdef class BinaryTree{{name_suffix}}:
             node_info = node_data[i_node]
 
             # ------------------------------------------------------------
-            # Case 1: query point is outside node radius:
-            #         trim it from the query
-            if reduced_dist_LB > heap.largest(i_pt):
+            # Case 1: query point is outside node radius (up to the
+            #         approximation factor): trim it from the query
+            if reduced_dist_LB * max_err > heap.largest(i_pt):
                 tree_stats.n_trims += 1
 
             # ------------------------------------------------------------
@@ -1790,6 +1829,7 @@ cdef class BinaryTree{{name_suffix}}:
         float64_t[::1] bounds,
         NeighborsHeap{{name_suffix}} heap,
         float64_t reduced_dist_LB,
+        float64_t max_err,
     ) except -1:
         """Recursive dual-tree k-neighbors query, depth-first"""
         # note that the array `bounds` is maintained such that
@@ -1806,9 +1846,9 @@ cdef class BinaryTree{{name_suffix}}:
         cdef intp_t i1, i2, i_pt, i_parent
 
         # ------------------------------------------------------------
-        # Case 1: nodes are further apart than the current bound:
-        #         trim both from the query
-        if reduced_dist_LB > bounds[i_node2]:
+        # Case 1: nodes are further apart than the current bound (up to
+        #         the approximation factor): trim both from the query
+        if reduced_dist_LB * max_err > bounds[i_node2]:
             pass
 
         # ------------------------------------------------------------
@@ -1820,13 +1860,16 @@ cdef class BinaryTree{{name_suffix}}:
             for i2 in range(node_info2.idx_start, node_info2.idx_end):
                 i_pt = other.idx_array[i2]
 
-                if heap.largest(i_pt) <= reduced_dist_LB:
+                if heap.largest(i_pt) <= reduced_dist_LB * max_err:
                     continue
 
                 for i1 in range(node_info1.idx_start, node_info1.idx_end):
+                    # query point first: a divergence is measured from the
+                    # query to the training point, as in the single-tree
+                    # queries
                     dist_pt = self.rdist(
-                        data1 + n_features * self.idx_array[i1],
                         data2 + n_features * i_pt,
+                        data1 + n_features * self.idx_array[i1],
                         n_features)
                     heap._push(i_pt, dist_pt, self.idx_array[i1])
 
@@ -1857,14 +1900,18 @@ cdef class BinaryTree{{name_suffix}}:
 
             if reduced_dist_LB1 < reduced_dist_LB2:
                 self._query_dual_depthfirst(i_node1, other, 2 * i_node2 + 1,
-                                            bounds, heap, reduced_dist_LB1)
+                                            bounds, heap, reduced_dist_LB1,
+                                            max_err)
                 self._query_dual_depthfirst(i_node1, other, 2 * i_node2 + 2,
-                                            bounds, heap, reduced_dist_LB2)
+                                            bounds, heap, reduced_dist_LB2,
+                                            max_err)
             else:
                 self._query_dual_depthfirst(i_node1, other, 2 * i_node2 + 2,
-                                            bounds, heap, reduced_dist_LB2)
+                                            bounds, heap, reduced_dist_LB2,
+                                            max_err)
                 self._query_dual_depthfirst(i_node1, other, 2 * i_node2 + 1,
-                                            bounds, heap, reduced_dist_LB1)
+                                            bounds, heap, reduced_dist_LB1,
+                                            max_err)
 
         # ------------------------------------------------------------
         # Case 3b: node 2 is a leaf or is smaller: split node 1 and
@@ -1877,14 +1924,18 @@ cdef class BinaryTree{{name_suffix}}:
 
             if reduced_dist_LB1 < reduced_dist_LB2:
                 self._query_dual_depthfirst(2 * i_node1 + 1, other, i_node2,
-                                            bounds, heap, reduced_dist_LB1)
+                                            bounds, heap, reduced_dist_LB1,
+                                            max_err)
                 self._query_dual_depthfirst(2 * i_node1 + 2, other, i_node2,
-                                            bounds, heap, reduced_dist_LB2)
+                                            bounds, heap, reduced_dist_LB2,
+                                            max_err)
             else:
                 self._query_dual_depthfirst(2 * i_node1 + 2, other, i_node2,
-                                            bounds, heap, reduced_dist_LB2)
+                                            bounds, heap, reduced_dist_LB2,
+                                            max_err)
                 self._query_dual_depthfirst(2 * i_node1 + 1, other, i_node2,
-                                            bounds, heap, reduced_dist_LB1)
+                                            bounds, heap, reduced_dist_LB1,
+                                            max_err)
         return 0
 
     cdef int _query_dual_breadthfirst(
@@ -1892,6 +1943,7 @@ cdef class BinaryTree{{name_suffix}}:
         BinaryTree{{name_suffix}} other,
         NeighborsHeap{{name_suffix}} heap,
         NodeHeap nodeheap,
+        float64_t max_err,
     ) except -1:
         """Non-recursive dual-tree k-neighbors query, breadth-first"""
         cdef intp_t i, i1, i2, i_node1, i_node2, i_pt
@@ -1921,9 +1973,9 @@ cdef class BinaryTree{{name_suffix}}:
             node_info2 = node_data2[i_node2]
 
             # ------------------------------------------------------------
-            # Case 1: nodes are further apart than the current bound:
-            #         trim both from the query
-            if reduced_dist_LB > bounds[i_node2]:
+            # Case 1: nodes are further apart than the current bound (up to
+            #         the approximation factor): trim both from the query
+            if reduced_dist_LB * max_err > bounds[i_node2]:
                 pass
 
             # ------------------------------------------------------------
@@ -1935,13 +1987,14 @@ cdef class BinaryTree{{name_suffix}}:
                 for i2 in range(node_info2.idx_start, node_info2.idx_end):
                     i_pt = other.idx_array[i2]
 
-                    if heap.largest(i_pt) <= reduced_dist_LB:
+                    if heap.largest(i_pt) <= reduced_dist_LB * max_err:
                         continue
 
                     for i1 in range(node_info1.idx_start, node_info1.idx_end):
+                        # query point first, see _query_dual_depthfirst
                         dist_pt = self.rdist(
-                            data1 + n_features * self.idx_array[i1],
                             data2 + n_features * i_pt,
+                            data1 + n_features * self.idx_array[i1],
                             n_features)
                         heap._push(i_pt, dist_pt, self.idx_array[i1])
 
@@ -2467,10 +2520,12 @@ cdef class BinaryTree{{name_suffix}}:
                 # If both nodes are leaves, go through all points
                 for i1 in range(node_info1.idx_start, node_info1.idx_end):
                     for i2 in range(node_info2.idx_start, node_info2.idx_end):
-                        dist_pt = self.dist((data1 + n_features
-                                             * idx_array1[i1]),
-                                            (data2 + n_features
+                        # query point (other) first: a divergence is
+                        # measured from the query to the training point
+                        dist_pt = self.dist((data2 + n_features
                                              * idx_array2[i2]),
+                                            (data1 + n_features
+                                             * idx_array1[i1]),
                                             n_features)
                         j = i_max - 1
                         while (j >= i_min) and (dist_pt <= r[j]):
