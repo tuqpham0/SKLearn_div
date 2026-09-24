@@ -839,6 +839,13 @@ cdef class BinaryTree{{name_suffix}}:
     cdef public const NodeData_t[::1] node_data
     cdef public const {{INPUT_DTYPE_t}}[:, :, ::1] node_bounds
 
+    # Cutting plane of each internal node (KD tree only): the cutting
+    # dimension, and (cut value, cell lower bound, cell upper bound) along
+    # it, where the cell is the root bounding box narrowed by the ancestors'
+    # cutting planes.  Used by query(node_bound='cell').
+    cdef public const intp_t[::1] node_cut_dim
+    cdef public const {{INPUT_DTYPE_t}}[:, ::1] node_cut
+
     cdef intp_t leaf_size
     cdef intp_t n_levels
     cdef intp_t n_nodes
@@ -865,6 +872,8 @@ cdef class BinaryTree{{name_suffix}}:
         self.idx_array = np.empty(1, dtype=np.intp, order='C')
         self.node_data = np.empty(1, dtype=NodeData, order='C')
         self.node_bounds = np.empty((1, 1, 1), dtype={{INPUT_DTYPE}})
+        self.node_cut_dim = np.empty(1, dtype=np.intp, order='C')
+        self.node_cut = np.empty((1, 3), dtype={{INPUT_DTYPE}})
 
         self.leaf_size = 0
         self.n_levels = 0
@@ -962,7 +971,9 @@ cdef class BinaryTree{{name_suffix}}:
                 int(self.n_splits),
                 int(self.n_calls),
                 self.dist_metric,
-                sample_weight)
+                sample_weight,
+                self.node_cut_dim.base,
+                self.node_cut.base)
 
     def __setstate__(self, state):
         """
@@ -981,6 +992,8 @@ cdef class BinaryTree{{name_suffix}}:
         self.n_calls = state[10]
         self.dist_metric = state[11]
         sample_weight = state[12]
+        self.node_cut_dim = state[13]
+        self.node_cut = state[14]
 
         self.euclidean = (self.dist_metric.__class__.__name__
                           == 'EuclideanDistance64')
@@ -1125,6 +1138,7 @@ cdef class BinaryTree{{name_suffix}}:
                                         n_features, n_points)
             partition_node_indices(data, idx_array, i_max, n_mid,
                                    n_features, n_points)
+            init_split{{name_suffix}}(self, i_node, i_max, idx_start + n_mid)
             self._recursive_build(node_data, 2 * i_node + 1,
                                   idx_start, idx_start + n_mid)
             self._recursive_build(node_data, 2 * i_node + 2,
@@ -1147,10 +1161,11 @@ cdef class BinaryTree{{name_suffix}}:
 
     def query(self, X, k=1, return_distance=True,
               dualtree=False, breadth_first=False,
-              sort_results=True):
+              sort_results=True, node_bound='box'):
         """
         query(X, k=1, return_distance=True,
-              dualtree=False, breadth_first=False)
+              dualtree=False, breadth_first=False, sort_results=True,
+              node_bound='box')
 
         query the tree for the k nearest neighbors
 
@@ -1175,6 +1190,14 @@ cdef class BinaryTree{{name_suffix}}:
             if True, then distances and indices of each point are sorted
             on return, so that the first column contains the closest points.
             Otherwise, neighbors are returned in an arbitrary order.
+        node_bound : {'box', 'cell'}, default='box'
+            how internal nodes are bounded during a single-tree depth-first
+            query. 'box' recomputes the distance to each child's bounding
+            box (O(n_features) per node). 'cell' visits the child on the
+            query's side of the cutting plane first and bounds the other
+            child by the distance to its cell, updated from the parent's in
+            O(1). Both are exact. 'cell' is only available for KDTree with
+            dualtree=False and breadth_first=False.
 
         Returns
         -------
@@ -1199,6 +1222,12 @@ cdef class BinaryTree{{name_suffix}}:
         if self.data.shape[0] < k:
             raise ValueError("k must be less than or equal "
                              "to the number of training points")
+
+        if node_bound not in ('box', 'cell'):
+            raise ValueError("node_bound must be 'box' or 'cell'")
+        if node_bound == 'cell' and (dualtree or breadth_first):
+            raise ValueError("node_bound='cell' requires dualtree=False "
+                             "and breadth_first=False")
 
         self._prep_thread_locals()
 
@@ -1237,6 +1266,13 @@ cdef class BinaryTree{{name_suffix}}:
                 for i in range(Xarr.shape[0]):
                     self._query_single_breadthfirst(pt, i, heap, nodeheap)
                     pt += Xarr.shape[1]
+            elif node_bound == 'cell':
+                with nogil:
+                    for i in range(Xarr.shape[0]):
+                        reduced_dist_LB = min_rdist{{name_suffix}}(self, 0, pt)
+                        query_single_cell{{name_suffix}}(self, 0, pt, i, heap,
+                                                         reduced_dist_LB)
+                        pt += Xarr.shape[1]
             else:
                 with nogil:
                     for i in range(Xarr.shape[0]):

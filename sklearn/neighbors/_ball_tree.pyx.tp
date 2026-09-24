@@ -83,6 +83,28 @@ cdef int allocate_data{{name_suffix}}(
     return 0
 
 
+cdef int init_split{{name_suffix}}(
+    BinaryTree{{name_suffix}} tree,
+    intp_t i_node,
+    intp_t cut_dim,
+    intp_t idx_mid,
+) except -1:
+    """The ball tree does not record cutting planes"""
+    return 0
+
+
+cdef int query_single_cell{{name_suffix}}(
+    BinaryTree{{name_suffix}} tree,
+    intp_t i_node,
+    const {{INPUT_DTYPE_t}}* pt,
+    intp_t i_pt,
+    NeighborsHeap{{name_suffix}} heap,
+    float64_t cell_rdist,
+) except -1 nogil:
+    with gil:
+        raise ValueError("node_bound='cell' is only available for KDTree")
+
+
 cdef int init_node{{name_suffix}}(
     BinaryTree{{name_suffix}} tree,
     NodeData_t[::1] node_data,

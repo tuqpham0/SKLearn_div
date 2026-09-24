@@ -67,6 +67,108 @@ cdef int allocate_data{{name_suffix}}(
 ) except -1:
     """Allocate arrays needed for the KD Tree"""
     tree.node_bounds = np.zeros((2, n_nodes, n_features), dtype={{INPUT_DTYPE}})
+    tree.node_cut_dim = np.zeros(n_nodes, dtype=np.intp)
+    tree.node_cut = np.zeros((n_nodes, 3), dtype={{INPUT_DTYPE}})
+    return 0
+
+
+cdef int init_split{{name_suffix}}(
+    BinaryTree{{name_suffix}} tree,
+    intp_t i_node,
+    intp_t cut_dim,
+    intp_t idx_mid,
+) except -1:
+    """Record the cutting plane of an internal node.
+
+    The cut value is the median coordinate that partition_node_indices left
+    at ``idx_mid`` (the low child's points are <= it, the high child's >= it).
+    The node's cell along ``cut_dim`` is the root bounding box narrowed by
+    the cutting planes of the ancestors that cut along the same dimension.
+    """
+    cdef intp_t* node_cut_dim = <intp_t*> &tree.node_cut_dim[0]
+    cdef {{INPUT_DTYPE_t}}* node_cut = <{{INPUT_DTYPE_t}}*> &tree.node_cut[0, 0]
+    cdef intp_t i_child = i_node, i_parent
+    cdef {{INPUT_DTYPE_t}} lo = tree.node_bounds[0, 0, cut_dim]
+    cdef {{INPUT_DTYPE_t}} hi = tree.node_bounds[1, 0, cut_dim]
+
+    while i_child > 0:
+        i_parent = (i_child - 1) // 2
+        if node_cut_dim[i_parent] == cut_dim:
+            if i_child == 2 * i_parent + 1:
+                hi = fmin(hi, node_cut[3 * i_parent])
+            else:
+                lo = fmax(lo, node_cut[3 * i_parent])
+        i_child = i_parent
+
+    node_cut_dim[i_node] = cut_dim
+    node_cut[3 * i_node] = tree.data[tree.idx_array[idx_mid], cut_dim]
+    node_cut[3 * i_node + 1] = lo
+    node_cut[3 * i_node + 2] = hi
+    return 0
+
+
+cdef int query_single_cell{{name_suffix}}(
+    BinaryTree{{name_suffix}} tree,
+    intp_t i_node,
+    const {{INPUT_DTYPE_t}}* pt,
+    intp_t i_pt,
+    NeighborsHeap{{name_suffix}} heap,
+    float64_t cell_rdist,
+) except -1 nogil:
+    """Single-tree depth-first k-neighbors query bounding nodes by their cell.
+
+    The child on the query's side of the cutting plane is visited first with
+    the parent's bound unchanged. The other child is bounded by the reduced
+    distance to its cell, which differs from the parent's only in the term
+    of the cutting dimension (Arya & Mount's incremental distance update),
+    and is skipped when that bound exceeds the current k-th distance.
+    """
+    cdef NodeData_t node_info = tree.node_data[i_node]
+    cdef float64_t p = tree.dist_metric.p
+    cdef intp_t i, cd, i_far
+    cdef float64_t dist_pt, qc, cv, d_cut, d_old, far_rdist
+
+    if node_info.is_leaf:
+        tree_stats.n_leaves += 1
+        for i in range(node_info.idx_start, node_info.idx_end):
+            dist_pt = tree.rdist(pt,
+                                 &tree.data[tree.idx_array[i], 0],
+                                 tree.data.shape[1])
+            heap._push(i_pt, dist_pt, tree.idx_array[i])
+        return 0
+
+    tree_stats.n_splits += 1
+    cd = tree.node_cut_dim[i_node]
+    cv = tree.node_cut[i_node, 0]
+    qc = pt[cd]
+
+    # d_cut: distance from the query to the cutting plane, the far child's
+    # term along cd.  d_old: the parent's term along cd, nonzero only when
+    # the query lies outside the parent's cell on that side.
+    if qc < cv:
+        query_single_cell{{name_suffix}}(tree, 2 * i_node + 1, pt, i_pt, heap,
+                                         cell_rdist)
+        i_far = 2 * i_node + 2
+        d_cut = cv - qc
+        d_old = fmax(0, tree.node_cut[i_node, 1] - qc)
+    else:
+        query_single_cell{{name_suffix}}(tree, 2 * i_node + 2, pt, i_pt, heap,
+                                         cell_rdist)
+        i_far = 2 * i_node + 1
+        d_cut = qc - cv
+        d_old = fmax(0, qc - tree.node_cut[i_node, 2])
+
+    if p == INF:
+        far_rdist = fmax(cell_rdist, d_cut)
+    elif tree.euclidean:
+        far_rdist = cell_rdist + d_cut * d_cut - d_old * d_old
+    else:
+        far_rdist = cell_rdist + pow(d_cut, p) - pow(d_old, p)
+
+    if far_rdist > heap.largest(i_pt):
+        tree_stats.n_trims += 1
+    else:
+        query_single_cell{{name_suffix}}(tree, i_far, pt, i_pt, heap, far_rdist)
     return 0
 
 

@@ -5,7 +5,11 @@ import pickle
 
 import numpy as np
 import pytest
-from numpy.testing import assert_allclose, assert_array_almost_equal
+from numpy.testing import (
+    assert_allclose,
+    assert_array_almost_equal,
+    assert_array_equal,
+)
 
 from sklearn.metrics import DistanceMetric
 from sklearn.neighbors._ball_tree import (
@@ -294,3 +298,84 @@ def test_pickle(Cls, metric, protocol):
     assert_array_almost_equal(dist1, dist2)
 
     assert isinstance(tree2, Cls)
+
+
+@pytest.mark.parametrize("metric", KD_TREE_METRICS)
+@pytest.mark.parametrize("k", (1, 3, 5))
+@pytest.mark.parametrize("leaf_size", (1, 3, 10))
+@pytest.mark.parametrize("dtype", (np.float64, np.float32))
+def test_kd_tree_query_cell_bound(metric, k, leaf_size, dtype):
+    rng = check_random_state(0)
+    X = rng.random_sample((60, DIMENSION)).astype(dtype)
+    Y = rng.random_sample((15, DIMENSION)).astype(dtype)
+    kwargs = METRICS[metric]
+
+    kdt = KDTree(X, leaf_size=leaf_size, metric=metric, **kwargs)
+    dist_box, ind_box = kdt.query(Y, k)
+    dist_cell, ind_cell = kdt.query(Y, k, node_bound="cell")
+    dist_ref, _ = brute_force_neighbors(X, Y, k, metric, **kwargs)
+
+    rtol = 1e-5 if dtype == np.float32 else 1e-10
+    assert_allclose(dist_cell, dist_ref, rtol=rtol)
+    assert_allclose(dist_cell, dist_box, rtol=rtol)
+    assert_array_equal(ind_cell, ind_box)
+
+
+def test_kd_tree_cells_contain_their_points():
+    rng = check_random_state(1)
+    X = rng.random_sample((200, 4))
+    kdt = KDTree(X, leaf_size=5)
+
+    node_data = np.asarray(kdt.node_data)
+    node_cut_dim = np.asarray(kdt.node_cut_dim)
+    node_cut = np.asarray(kdt.node_cut)
+    idx_array = np.asarray(kdt.idx_array)
+
+    assert node_cut.shape == (node_data.shape[0], 3)
+    for i_node, info in enumerate(node_data):
+        if info["is_leaf"]:
+            continue
+        cd = node_cut_dim[i_node]
+        cut_val, cell_lo, cell_hi = node_cut[i_node]
+        lo_child = node_data[2 * i_node + 1]
+        hi_child = node_data[2 * i_node + 2]
+        x_lo = X[idx_array[lo_child["idx_start"] : lo_child["idx_end"]], cd]
+        x_hi = X[idx_array[hi_child["idx_start"] : hi_child["idx_end"]], cd]
+        # the cutting plane separates the children
+        assert np.all(x_lo <= cut_val)
+        assert np.all(x_hi >= cut_val)
+        # and the cell contains all of the node's points
+        x_all = X[idx_array[info["idx_start"] : info["idx_end"]], cd]
+        assert cell_lo <= x_all.min()
+        assert cell_hi >= x_all.max()
+    cd = node_cut_dim[0]
+    assert node_cut[0, 1] == X[:, cd].min()
+    assert node_cut[0, 2] == X[:, cd].max()
+
+
+@pytest.mark.parametrize("protocol", (0, 1, 2))
+def test_kd_tree_cell_bound_pickle(protocol):
+    rng = check_random_state(2)
+    X = rng.random_sample((50, 3))
+    tree1 = KDTree(X, leaf_size=2)
+    dist1, ind1 = tree1.query(X, 3, node_bound="cell")
+
+    tree2 = pickle.loads(pickle.dumps(tree1, protocol=protocol))
+    dist2, ind2 = tree2.query(X, 3, node_bound="cell")
+
+    assert_allclose(dist1, dist2)
+    assert_array_equal(ind1, ind2)
+
+
+def test_kd_tree_cell_bound_validation():
+    rng = check_random_state(3)
+    X = rng.random_sample((20, 3))
+    kdt = KDTree(X, leaf_size=2)
+    with pytest.raises(ValueError, match="node_bound must be 'box' or 'cell'"):
+        kdt.query(X, 1, node_bound="sphere")
+    with pytest.raises(ValueError, match="requires dualtree=False"):
+        kdt.query(X, 1, node_bound="cell", dualtree=True)
+    with pytest.raises(ValueError, match="requires dualtree=False"):
+        kdt.query(X, 1, node_bound="cell", breadth_first=True)
+    with pytest.raises(ValueError, match="only available for KDTree"):
+        BallTree(X, leaf_size=2).query(X, 1, node_bound="cell")
